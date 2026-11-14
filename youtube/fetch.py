@@ -45,6 +45,8 @@ import re
 import sys
 import threading
 import time
+import contextvars
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -58,6 +60,34 @@ SUGGEST_URL = "https://suggestqueries-clients6.youtube.com/complete/search"
 IMPERSONATE = "chrome"
 TIMEOUT = 30
 FANOUT_WORKERS = 8
+_deadline = contextvars.ContextVar("youtube_deadline", default=None)
+
+
+class YoutubeTimeout(Exception):
+    """The caller's overall time budget expired."""
+
+
+def _remaining(default=None):
+    end = _deadline.get()
+    if end is None:
+        return default
+    left = end - time.monotonic()
+    if left <= 0:
+        raise YoutubeTimeout("YouTube request deadline expired")
+    return min(default, left) if default is not None else left
+
+
+@contextmanager
+def deadline(seconds):
+    """Bound a scraper call and propagate its budget to fan-out workers."""
+    end = time.monotonic() + seconds
+    parent = _deadline.get()
+    token = _deadline.set(min(parent, end) if parent is not None else end)
+    try:
+        yield
+        _remaining()
+    finally:
+        _deadline.reset(token)
 
 ANDROID_UA = "com.google.android.youtube/{v} (Linux; U; Android 11) gzip"
 BASE_HEADERS = {
@@ -152,13 +182,15 @@ def dump_debug(name, text):
 def _retrying(fn):
     last = None
     for attempt in range(1, config.MAX_RETRIES + 1):
+        _remaining()
         try:
             return fn()
         except YoutubeUpstreamError as e:        # includes YoutubeBlocked
             last = e
             _drop_session()
         if attempt < config.MAX_RETRIES:
-            time.sleep(config.RETRY_BACKOFF * attempt)
+            time.sleep(_remaining(config.RETRY_BACKOFF * attempt))
+        _remaining()
     raise last
 
 
@@ -176,13 +208,17 @@ def client_config():
     now = time.time()
     if now - _client["at"] < config.YOUTUBE_CLIENT_REFRESH:
         return _client
-    with _client_lock:
+    wait = _remaining()
+    acquired = _client_lock.acquire() if wait is None else _client_lock.acquire(timeout=wait)
+    if not acquired:
+        raise YoutubeTimeout("YouTube client configuration deadline expired")
+    try:
         if now - _client["at"] < config.YOUTUBE_CLIENT_REFRESH:
             return _client
         _client["at"] = now      # one attempt per period even when it fails
         try:
             resp = _session().get(SITE + "/?hl=en&gl=US", headers={"accept-language": "en-US,en;q=0.9"},
-                                  cookies=PAGE_COOKIES, timeout=TIMEOUT)
+                                  cookies=PAGE_COOKIES, timeout=_remaining(TIMEOUT))
             if resp.status_code == 200:
                 key = _KEY_RE.search(resp.text or "")
                 version = _VERSION_RE.search(resp.text or "")
@@ -190,8 +226,12 @@ def client_config():
                     _client["key"] = key.group(1)
                 if version:
                     _client["web_version"] = version.group(1)
+        except YoutubeTimeout:
+            raise
         except Exception:
             _drop_session()
+    finally:
+        _client_lock.release()
     return _client
 
 
@@ -233,7 +273,9 @@ def _post_json(url, payload, headers, label):
     def once():
         sess = _session()
         try:
-            resp = sess.post(url, headers=headers, data=json.dumps(payload), timeout=TIMEOUT)
+            resp = sess.post(url, headers=headers, data=json.dumps(payload), timeout=_remaining(TIMEOUT))
+        except YoutubeTimeout:
+            raise
         except Exception as e:
             raise YoutubeUpstreamError(f"request failed: {type(e).__name__}: {e}")
         status = resp.status_code
@@ -287,13 +329,15 @@ def player(video_id, *, client="WEB", hl="en", gl="US"):
         return data
     last = None
     for attempt in range(1, config.MAX_RETRIES + 1):
+        _remaining()
         try:
             return once()
         except YoutubeBotCheck as e:      # transport errors already retried inside innertube()
             last = e
             _drop_session()
         if attempt < config.MAX_RETRIES:
-            time.sleep(config.RETRY_BACKOFF * attempt)
+            time.sleep(_remaining(config.RETRY_BACKOFF * attempt))
+        _remaining()
     raise last
 
 
@@ -315,7 +359,9 @@ def _get_text(url, *, params=None, headers=None, label="page", cookies=None, ret
         sess = _session()
         try:
             resp = sess.get(url, params=params, headers=headers or {"accept-language": "en-US,en;q=0.9"},
-                            cookies=cookies, timeout=TIMEOUT)
+                            cookies=cookies, timeout=_remaining(TIMEOUT))
+        except YoutubeTimeout:
+            raise
         except Exception as e:
             raise YoutubeUpstreamError(f"request failed: {type(e).__name__}: {e}")
         status = resp.status_code
@@ -404,11 +450,19 @@ def run_parallel(fns):
     """Run callables concurrently -> results in order (exceptions propagate)."""
     if not fns:
         return []
+    _remaining()
+    def run(fn):
+        _remaining()
+        result = fn()
+        _remaining()
+        return result
     if len(fns) == 1:
-        return [fns[0]()]
+        return [run(fns[0])]
     with ThreadPoolExecutor(max_workers=min(FANOUT_WORKERS, len(fns))) as ex:
-        futures = [ex.submit(fn) for fn in fns]
-        return [f.result() for f in futures]
+        futures = [ex.submit(contextvars.copy_context().run, run, fn) for fn in fns]
+        results = [f.result() for f in futures]
+    _remaining()
+    return results
 
 
 def run_parallel_safe(fns):

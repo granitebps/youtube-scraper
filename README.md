@@ -1,168 +1,102 @@
-# 🎬 YouTube Scraper
+# YouTube Scraper MCP
 
-YouTube Scraper is a **free and open-source** scraper that gets you **unlimited** detailed YouTube data for free.
+This fork keeps the upstream YouTube scraper's REST API and adds a read-only MCP server for local clients and Fami/OpenClaw on the homeserver. It calls YouTube's public logged-out JSON endpoints through the existing scraper modules. It does not require a browser or a YouTube account.
 
-## ✨ What Can I Get?
+## MCP tools
 
-- 🎬 **Full details on any video — even Despacito's 9.1B views** — exact views & likes, chapters, most-replayed heatmap, music credits & captions
-- 🔍 **Search the 500+ hours uploaded every minute** — videos, Shorts, channels, playlists & movies with YouTube's own filters
-- 📺 **Channels up to MrBeast's 518M subscribers** — exact subscribers, views & joined date, plus videos, Shorts, live, playlists & posts
-- 💬 **605K+ comments on Shake It Off alone** — every comment & reply, transcripts, subtitles, live chat & YouTube Charts
+| Tool | Inputs | Result |
+| --- | --- | --- |
+| `search_videos` | `query`, `type`, optional `upload_date`, `duration`, `sort`, `features`, `country`, `language`, `cursor`, `limit` | Search results for videos, Shorts, channels, playlists or movies |
+| `get_video` | `video`, `country`, `language` | Metadata, counts, captions, chapters and channel |
+| `get_video_transcript` | `video`, optional `language`, `format` (`text` or `segments`), `cursor`, `max_chars` | Bounded transcript text or timed segments |
+| `get_video_subtitles` | `video` | Subtitle tracks and WebVTT links |
+| `get_video_streams` | `video`, `country` | Available audio/video stream links |
+| `get_video_comments` | `video`, `sort`, `country`, `language`, `cursor`, `limit` | Comments with reply cursors |
+| `get_comment_replies` | `cursor`, `country`, `language`, `limit` | One page of replies |
+| `get_channel` | `channel`, `country`, `language` | Channel profile and available tabs |
+| `get_channel_videos` | `channel`, `tab` (`videos`, `shorts`, `live`), `sort`, `country`, `language`, `cursor`, `limit` | Channel uploads, Shorts or live streams |
+| `get_playlist` | `playlist`, `country`, `language` | Playlist details |
+| `get_playlist_videos` | `playlist`, `country`, `language`, `cursor`, `limit` | Playlist entries |
+| `resolve_link` | `link` | YouTube link type and resolved identifier |
 
-## 🎥 Example: A Full YouTube Video
+Video, channel and playlist inputs accept IDs or YouTube links. Lists default to 5 items and accept a `limit` from 1 to 12. Pass `next_cursor` unchanged with the same filters. Cursors retain the remaining items on the current YouTube page before moving to the next page. Pages come from live upstream data; after cache expiry or a server restart, restart paging if a cursor is rejected.
+
+Transcripts default to text, up to 8,000 characters per call. `max_chars` accepts 1 to 20,000. Each response also includes at most 200 caption segments. Select `format: "segments"` to receive timestamps with the text. Both formats return `has_more` and `next_cursor` when more transcript remains. Pass the cursor with the same video and language. Concatenating text pages reconstructs the transcript, including spaces between segments. A split segment keeps its original timestamps and reports its character offset. Available captions vary by video. Stream and subtitle links are signed and may expire; a returned link does not guarantee that another network can download it.
+
+Errors are MCP tool errors with `{ "error": { "code", "message", "retryable" } }`. A block or timeout is an error, not an empty result.
+
+## Run locally
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements-dev.txt
+.venv/bin/python mcp_server.py --stdio
+```
+
+Configure a local harness to launch the absolute path to this checkout's `.venv/bin/python`, with arguments `["/absolute/path/to/youtube-scraper/mcp_server.py", "--stdio"]` and the checkout as its working directory. The MCP server can also run as HTTP locally with `.venv/bin/python mcp_server.py`; it listens on port 8000 by default.
+
+Configuration environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MCP_HOST` | `127.0.0.1` locally, `0.0.0.0` in Docker | HTTP bind address |
+| `PORT` | `8000` | HTTP port |
+| `MCP_TOOL_TIMEOUT` | `45` | Overall seconds per MCP call, including queue time and scraper retries |
+| `MCP_MAX_CONCURRENCY` | `4` | Simultaneous MCP calls |
+| `MCP_CACHE_SIZE` | `500` | In-memory result pages; `0` disables caching |
+| `YOUTUBE_PROXY` | unset | Optional proxy URL used for all scraper requests |
+
+The transport's `youtube_proxy()` and `youtube_fallback_proxy()` helpers both read `YOUTUBE_PROXY`; there is no separate automatic fallback-proxy setting. Compose forwards this optional setting from the environment or the checkout's `.env` file. Without a proxy, blocked requests return a retryable tool error. REST users can continue to start the server with `python run.py`.
+
+## Homeserver deployment
+
+The Compose service joins the external `ai-routing` Docker network and publishes no host ports. Fami/OpenClaw connects to `http://youtube-scraper:8000/mcp` over Streamable HTTP. The endpoint has no application authentication; keep it inside the trusted Docker network or put an authenticated gateway in front of it before exposing it elsewhere.
+
+Build and start from the deployed checkout:
+
+```bash
+docker network inspect ai-routing >/dev/null 2>&1 || docker network create ai-routing
+docker compose up -d --build
+```
+
+The Compose file starts with provisional limits of 256 MiB memory and 0.5 CPU. Measure on the homeserver and adjust from observed peak usage. Its health check verifies the service process, not YouTube reachability.
+
+Configure Fami/OpenClaw with Streamable HTTP and this tool filter:
 
 ```json
 {
-  "video": {
-    "id": "kJQP7kiw5Fk",
-    "title": "Luis Fonsi - Despacito ft. Daddy Yankee",
-    "link": "https://www.youtube.com/watch?v=kJQP7kiw5Fk",
-    "thumbnail": "https://i.ytimg.com/vi/kJQP7kiw5Fk/maxresdefault.jpg",
-    "description": "“Despacito” disponible ya en todas las plataformas digitales: https://UMLE.lnk.to/DOoUzFp \n“Imposible” disponible ya...",
-    "duration_seconds": 282,
-    "category": "Music",
-    "hashtags": ["Despacito", "LuisFonsi", "EchamelaCulpa"],
-    "published_at": "2017-01-13T05:00:02Z",
-    "view_count": 9132930752,
-    "like_count": 56707084,
-    "comment_count": 4300000,
-    "has_captions": true,
-    "channel": {"id": "UCxoq-PAQeAdk_zyg8YS0JqA", "name": "Luis Fonsi", "handle": "@LuisFonsiVEVO", "subscriber_count": 32600000, "is_verified": true, "is_artist": true},
-    "music": [
-      {"title": "Despacito", "artist": "Luis Fonsi", "album": "Despacito"}
-    ],
-    "heatmap": [
-      {"start_seconds": 0.0, "duration_seconds": 2.8, "intensity": 0.6978},
-      {"start_seconds": 2.8, "duration_seconds": 2.8, "intensity": 0.4731}
-    ],
-    "subtitles": [
-      {"language_code": "en", "language": "English - en", "is_auto_generated": false},
-      {"language_code": "es", "language": "Spanish", "is_auto_generated": false}
-    ],
-    "end_screen": [
-      {"type": "playlist", "id": "PL9tY0BWXOZFtc4Kan4Q0HApZcdRuXN0YA", "title": "Sabores de Mi Tierra | Vevo Playlist", "start_seconds": 271.0, "end_seconds": 281.0}
-    ]
+  "youtube-scraper": {
+    "enabled": true,
+    "url": "http://youtube-scraper:8000/mcp",
+    "transport": "streamable-http",
+    "toolFilter": {
+      "include": [
+        "search_videos", "get_video", "get_video_transcript", "get_video_subtitles",
+        "get_video_streams", "get_video_comments", "get_comment_replies", "get_channel",
+        "get_channel_videos", "get_playlist", "get_playlist_videos", "resolve_link"
+      ]
+    }
   }
 }
 ```
 
-*Trimmed for readability.*
+Use `scripts/deploy` on the homeserver to build this checkout, start the service, compare the running adapter and transport source against the checkout, and verify health plus the exact tool set. Add `--pull` to fast-forward from the configured Git upstream first; the script refuses to pull a dirty checkout. Before rebuilding, it tags the running container's image as `youtube-scraper:rollback` and keeps that image for manual recovery. On a first deployment, no rollback image exists unless a previous local image is present. Deployment and rollback are explicit operator actions.
 
-## 🚀 Unlimited Free YouTube Data — Get It in 60 Seconds
+To restore the previous image without rebuilding:
 
-1️⃣ Clone and install:
 ```bash
-git clone https://github.com/omkarcloud/youtube-scraper
-cd youtube-scraper
-python -m pip install -r requirements.txt
+docker image tag youtube-scraper:rollback youtube-scraper:local
+docker compose up -d --no-build --force-recreate youtube-scraper
 ```
 
-2️⃣ Start the API:
+## Verify
+
 ```bash
-python run.py
+.venv/bin/python -m pytest youtube/test_parsers.py test_mcp_server.py -q
+.venv/bin/python scripts/smoke_mcp.py
+.venv/bin/python scripts/smoke_mcp.py --url http://127.0.0.1:8000/mcp
 ```
 
-3️⃣ Get your first data:
-```bash
-curl "http://localhost:8000/videos/details?video=kJQP7kiw5Fk"
-```
+The smoke script makes live YouTube requests. Add `--probe-media` to request only the first 1 KiB of a sample video stream. Run qualification from the homeserver as well because its egress may receive different results.
 
-```json
-{
-  "video": {
-    "id": "kJQP7kiw5Fk",
-    "title": "Luis Fonsi - Despacito ft. Daddy Yankee",
-    "link": "https://www.youtube.com/watch?v=kJQP7kiw5Fk",
-    "duration_seconds": 282,
-    "category": "Music",
-    "published_at": "2017-01-13T05:00:02Z",
-    "view_count": 9132932509,
-    "like_count": 56707088,
-    "comment_count": 4300000,
-    "channel": {"id": "UCxoq-PAQeAdk_zyg8YS0JqA", "name": "Luis Fonsi", "handle": "@LuisFonsiVEVO", "subscriber_count": 32600000, "is_verified": true},
-    "music": [
-      {"title": "Despacito", "artist": "Luis Fonsi", "album": "Despacito"}
-    ],
-    "heatmap": [
-      {"start_seconds": 0.0, "duration_seconds": 2.8, "intensity": 0.6978}
-    ]
-  }
-}
-```
-
-All 28 endpoints are now live at `http://localhost:8000`.
-
-## 📚 Endpoints
-
-28 endpoints cover everything you need.
-
-| Endpoint | Path | Returns |
-|---|---|---|
-| Video Details | `/videos/details` | Everything about one video: exact views, likes, chapters, heatmap, music |
-| Search Suggestions | `/search/suggestions` | YouTube's own autocomplete for any partial query |
-| Search | `/search` | Videos, Shorts, channels, playlists and movies with YouTube's filters |
-| Video Details (Batch) | `/videos/details/batch` | Views, likes and publish time for 20 videos per call |
-| Video / Post Comments | `/videos/comments`, `/posts/comments` | Top or newest comments with likes, replies and pinned flags |
-| Comment Replies | `/comments/replies` | Every reply under any comment |
-| Video Transcript | `/videos/transcript` | Timed transcript as JSON, text, SRT or WebVTT |
-| Video Subtitles | `/videos/subtitles` | Every subtitle track with a ready WebVTT link |
-| Related Videos | `/videos/related` | The watch-next column: videos, mixes and playlists |
-| Video Streams | `/videos/streams` | Direct video and audio links, HLS for live, storyboards |
-| Live Chat | `/videos/live-chat` | Live messages, Super Chats and memberships, or chat replay |
-| Channel Details | `/channels/details` | Exact subscribers, views, videos, joined date and links |
-| Channel Videos / Shorts / Live | `/channels/videos`, `/channels/shorts`, `/channels/live` | Uploads, Shorts or streams — latest, popular or oldest first |
-| Channel Playlists | `/channels/playlists` | Playlists, albums and singles, podcasts or courses |
-| Channel Posts | `/channels/posts` | Community posts with images, polls, likes and comments |
-| Channel Home | `/channels/home` | Featured video and every shelf on the Home tab |
-| Channel Search | `/channels/search` | Search inside one channel's videos and playlists |
-| Playlist Details / Videos | `/playlists/details`, `/playlists/videos` | Owner, views, update date; 100 videos per page |
-| Post Details | `/posts/details` | One community post with its images or poll |
-| Hashtag Videos | `/hashtags/videos` | Videos or Shorts for any hashtag, with usage counts |
-| Shorts Sound | `/shorts/sound` | A Short's sound and the Shorts made with it |
-| YouTube Charts | `/charts` | Top and trending videos, songs, artists and podcasts by country |
-| Explore Feed | `/explore` | News, live, sports, gaming, movies and more, as titled sections |
-| Resolve Link | `/resolve` | Any YouTube link turned into its type and ID |
-
-## 🔍 Exploring Parameters
-
-The same API is published on RapidAPI, and its playground is the easiest place to try parameters and see raw responses. Once a request looks right, run it locally for **unlimited free** data.
-
-1. [Subscribe to the free plan](https://rapidapi.com/OmkarCloud/api/best-youtube-scraper-free-1000-calls/pricing) — 1,000 calls/month, no credit card.
-2. [Try the endpoints in the playground](https://rapidapi.com/OmkarCloud/api/best-youtube-scraper-free-1000-calls/playground) — every param is pre-filled, so you see real data in one click.
-3. Copy the generated code and replace `https://best-youtube-scraper-free-1000-calls.p.rapidapi.com` with `http://localhost:8000`. It will now run against your local API.
-
-```python
-import requests
-
-# generated by the playground, host swapped for the local API
-response = requests.get(
-    "http://localhost:8000/videos/details",
-    params={"video": "kJQP7kiw5Fk"},
-)
-print(response.json())
-```
-
-## 💬 Have Questions? We Have Answers.
-
-You're a developer — we know how hard completing a project can be. So we offer full support: just message us and we'll reply ✅ with a solution within 1 working day.
-
-[![Message Us on WhatsApp about YouTube Scraper](https://raw.githubusercontent.com/omkarcloud/assets/master/images/whatsapp-us.png)](https://www.omkar.cloud/l/youtube-scraper-github-whatsapp)
-
-[![Ask Us by Email about YouTube Scraper](https://raw.githubusercontent.com/omkarcloud/assets/master/images/ask-on-email.png)](mailto:happy.to.help@omkar.cloud?subject=Help%20with%20YouTube%20Scraper%20API&body=I%20need%20help%20using%20the%20YouTube%20Scraper%20API.)
-
-## ⚡ Popular Scrapers by Omkar Cloud
-
-- [**Google Maps Scraper (3,100+ GitHub Stars)**](https://github.com/omkarcloud/google-maps-scraper) — type "dentists in New York", get every business as a ready-to-call lead list: phones, emails, websites & reviews. Up to 100K free leads/month.
-- [**G2 Scraper**](https://www.omkar.cloud/tools/g2-scraper) — G2 product details, ratings & AI-found contacts
-- [**Website Email Contact Scraper**](https://www.omkar.cloud/tools/website-email-contact-scraper) — emails, phones & socials from any website
-- [**AliExpress Scraper**](https://www.omkar.cloud/tools/aliexpress-scraper-api) — live product details, SKU variants, stock & shipping
-- [**Booking Scraper**](https://www.omkar.cloud/tools/booking-scraper) — Booking.com hotels: prices, ratings, rooms & amenities
-- [**IMDb Scraper**](https://github.com/omkarcloud/imdb-scraper) — movies, TV shows, ratings, cast & box office
-
-## ⭐ Love It? [Star It ⭐!](https://github.com/omkarcloud/youtube-scraper)
-
-Star the repo ⭐ and become my star hero!
-
-It's just 1 click, but it means the world to me.
-
-[![Star us on GitHub](https://raw.githubusercontent.com/omkarcloud/google-maps-scraper/master/screenshots/star-us.png)](https://github.com/omkarcloud/youtube-scraper)
+This fork is based on [omkarcloud/youtube-scraper](https://github.com/omkarcloud/youtube-scraper). See [LICENSE](LICENSE).

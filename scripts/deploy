@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+COMPOSE=(docker compose)
+PULL=0
+for arg in "$@"; do
+  case "$arg" in
+    --pull) PULL=1 ;;
+    -h|--help)
+      echo "Usage: scripts/deploy [--pull]"
+      echo "Build and deploy this checkout to the homeserver; keep the previous image as youtube-scraper:rollback."
+      echo "Use --pull to fast-forward from the configured upstream before deploying."
+      exit 0
+      ;;
+    *) echo "Unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+cd "$(dirname "$0")/.."
+[[ -f docker-compose.yaml ]] || { echo "Run from a youtube-scraper checkout." >&2; exit 1; }
+docker info >/dev/null 2>&1 || { echo "Cannot reach Docker." >&2; exit 1; }
+"${COMPOSE[@]}" version >/dev/null 2>&1 || { echo "Docker Compose is unavailable." >&2; exit 1; }
+if [[ $PULL -eq 1 ]]; then
+  [[ -z "$(git status --porcelain)" ]] || { echo "Working tree is dirty; commit or deploy without --pull." >&2; exit 1; }
+  git pull --ff-only
+fi
+
+docker network inspect ai-routing >/dev/null 2>&1 || docker network create ai-routing >/dev/null
+previous_container="$("${COMPOSE[@]}" ps -q youtube-scraper)"
+if [[ -n "$previous_container" ]]; then
+  previous_image="$(docker inspect --format '{{.Image}}' "$previous_container")"
+  docker image tag "$previous_image" youtube-scraper:rollback
+elif docker image inspect youtube-scraper:local >/dev/null 2>&1; then
+  docker image tag youtube-scraper:local youtube-scraper:rollback
+fi
+"${COMPOSE[@]}" build
+"${COMPOSE[@]}" up -d
+
+container_id="$("${COMPOSE[@]}" ps -q youtube-scraper)"
+[[ -n "$container_id" ]] || { echo "YouTube service container was not created." >&2; exit 1; }
+for _ in $(seq 1 30); do
+  health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id")"
+  [[ "$health" == healthy ]] && break
+  sleep 2
+done
+[[ "${health:-}" == healthy ]] || { echo "Service did not become healthy. Check: docker compose logs youtube-scraper" >&2; exit 1; }
+
+# Compare the running source, since an existing container may still have an old build.
+for source in mcp_server.py youtube/fetch.py; do
+  docker exec "$container_id" cat "/app/$source" | cmp - "$source" >/dev/null || {
+    echo "Running container does not match $source in this checkout." >&2; exit 1;
+  }
+done
+
+tools="$("${COMPOSE[@]}" exec -T youtube-scraper python -c '
+import json, os, urllib.request
+req = urllib.request.Request("http://127.0.0.1:%s/mcp" % os.environ.get("PORT", "8000"),
+    data=json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/list"}).encode(),
+    headers={"content-type":"application/json","accept":"application/json, text/event-stream"})
+tools = json.load(urllib.request.urlopen(req, timeout=10))["result"]["tools"]
+expected = {"search_videos", "get_video", "get_video_transcript", "get_video_subtitles", "get_video_streams",
+            "get_video_comments", "get_comment_replies", "get_channel", "get_channel_videos", "get_playlist",
+            "get_playlist_videos", "resolve_link"}
+if {tool["name"] for tool in tools} != expected:
+    raise SystemExit("Unexpected MCP tool set")
+print(len(tools))
+')"
+[[ "$tools" == 12 ]] || { echo "Expected 12 MCP tools, got $tools. Check: docker compose logs youtube-scraper" >&2; exit 1; }
+echo "youtube-scraper is healthy with $tools MCP tools and matches this checkout."
+if docker image inspect youtube-scraper:rollback >/dev/null 2>&1; then
+  echo "Previous image: youtube-scraper:rollback."
+fi
